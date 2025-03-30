@@ -1,17 +1,23 @@
-#include <stdlib.h>
-#include <stdio.h>
-#include <stdint.h>
-#include <stdarg.h>
-#include <string.h>
-#include <unistd.h>
+#include <assert.h>
 #include <errno.h>
+#include <getopt.h>
+#include <regex.h>
+#include <stdarg.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/uio.h>
+#include <unistd.h>
 
-#define SHELLPEEK_OK 0
-#define SHELLPEEK_ERR -1
-#define SHELLPEEK_NOTFOUND -2
-
+#define SHELLPEEK_VERSION "0.1.0"
 #define SHELLPEEK_STR_SIZE 1024
+
+enum {
+  SHELLPEEK_OK = 0,
+  SHELLPEEK_ERR,
+  SHELLPEEK_NOTFOUND,
+};
 
 #define if_err_return(rv, expr) if (((rv) = (expr)) != SHELLPEEK_OK) return (rv)
 #define if_err_break(rv, expr)  if (((rv) = (expr)) != SHELLPEEK_OK) break
@@ -70,80 +76,405 @@ struct bash_array {
     struct bash_array_element *lastref;
 };
 
-static int get_symbol_addr(pid_t pid, const char *symbol, uintptr_t *raddr);
+struct shellpeek_context {
+    pid_t pid;
+    uintptr_t shell_variables_addr;
+    uintptr_t root_shell_variables_addr;
+    uintptr_t line_number_addr;
+    char *var_name;
+    regex_t var_regex;
+    int var_regex_set;
+    int var_all;
+    int max_depth;
+    long num_stack_frames;
+    char tmp[SHELLPEEK_STR_SIZE];
+    useconds_t sleep_usec;
+    int repeat;
+    int pause_process;
+    int exit_code;
+    int peek_var_frame;
+    struct bash_array array_func;
+    struct bash_array array_source;
+    struct bash_array array_lineno;
+    struct bash_var_context var_context;
+};
+
+static void run(struct shellpeek_context *ctx);
+static int peek(struct shellpeek_context *ctx);
+static int peek_stack(struct shellpeek_context *ctx, int frame);
+static int peek_var(struct shellpeek_context *ctx, int frame, char *var_name, struct bash_variable *out_var);
+static int peek_array(struct shellpeek_context *ctx, char *var_name, struct bash_array *out_arr);
+static int peek_array_element(struct shellpeek_context *ctx, struct bash_array *arr, int i, char *buf, size_t nbuf);
+static int peek_hash(struct shellpeek_context *ctx, struct bash_hash_table *ht, int frame, char *var_name, struct bash_variable *out_var);
+static unsigned int hash_string(char *s);
+static void set_var_regex(struct shellpeek_context *ctx, char *regex);
+static void usage(struct shellpeek_context *ctx, FILE *fp, int exit_code);
+static void parse_args(int argc, char **argv, struct shellpeek_context *ctx);
+static void cleanup(struct shellpeek_context *ctx);
+static void print_version(struct shellpeek_context *ctx);
+static int copy_proc_mem(pid_t pid, uintptr_t raddri, void *laddr, size_t size, char *what_fmt, ...);
+static int get_symbol_addr(pid_t pid, char *symbol, uintptr_t *raddr);
 static int get_bash_bin_path(pid_t pid, char *path_root, size_t path_root_size, char *path, size_t path_size);
 static int get_bash_base_addr(pid_t pid, char *path, uintptr_t *raddr);
-static int get_symbol_offset(char *path_root, const char *symbol, uintptr_t *raddr);
+static int get_symbol_offset(char *path_root, char *symbol, uintptr_t *raddr);
 static int popen_read_line(char *buf, size_t buf_size, char *cmd_fmt, ...);
-static int shell_escape(const char *arg, char *buf, size_t buf_size, const char *what);
-static int copy_proc_mem(pid_t pid, uintptr_t raddri, void *laddr, size_t size, const char *what);
-static int var_copy(pid_t pid, uintptr_t shell_variables_ptr_addr, const char *varname, struct bash_variable *var);
-static int var_dump(pid_t pid, uintptr_t shell_variables_ptr_addr);
-static int var_scan(pid_t pid, uintptr_t shell_variables_ptr_addr, const char *varname, struct bash_variable *var);
-static int var_copy_str(pid_t pid, uintptr_t shell_variables_ptr_addr, const char *varname, char *buf, size_t nbuf);
-static int var_copy_array(pid_t pid, uintptr_t shell_variables_ptr_addr, const char *varname, struct bash_array *arr);
-static int var_copy_array_element(pid_t pid, struct bash_array *arr, int i, char *buf, size_t nbuf);
-static int hash_lookup(pid_t pid, struct bash_hash_table *ht, const char *key, struct bash_variable *out_var);
-static int hash_dump(pid_t pid, struct bash_hash_table *ht);
-static int hash_scan(pid_t pid, struct bash_hash_table *ht, const char *key, struct bash_variable *out_var);
-static unsigned int hash_string(const char *s);
+static int shell_escape(char *arg, char *buf, size_t buf_size, char *what);
 
 static int rv;
 
-// TODO: make hash_scan and var_scan cleaner with callbacks
-// TODO: get symbol table for each frame in stacktrace
 // TODO: print vars in `typeset -p ...` format
 // TODO: detect var type before printing
-// TODO: getopt
 
 int main(int argc, char **argv) {
-    if (argc < 3) return 1;
+    struct shellpeek_context ctx;
 
-    pid_t pid = atoi(argv[1]);
-    char *varname = argv[2];
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.repeat = 1;
+    ctx.max_depth = 0;
 
-    uintptr_t shell_variables_addr;
-    if_err_return(rv, get_symbol_addr(pid, "shell_variables", &shell_variables_addr));
+    parse_args(argc, argv, &ctx);
+    run(&ctx);
+    cleanup(&ctx);
 
-    uintptr_t line_number_addr;
-    if_err_return(rv, get_symbol_addr(pid, "line_number", &line_number_addr));
-
-    uintptr_t shell_variables_ptr_addr;
-    if_err_return(rv, copy_proc_mem(pid, shell_variables_addr, &shell_variables_ptr_addr, sizeof(shell_variables_ptr_addr), "shell_variables_ptr"));
-
-    //char buf[SHELLPEEK_STR_SIZE];
-    //if_err_return(rv, var_copy_str(pid, shell_variables_ptr_addr, varname, buf, sizeof(buf)));
-    //printf("%s=%s\n", varname, buf);
-    (void)varname;
-
-    var_dump(pid, shell_variables_ptr_addr);
-
-    struct bash_array arr_funcname, arr_source, arr_lineno;
-    if_err_return(rv, var_copy_array(pid, shell_variables_ptr_addr, "FUNCNAME", &arr_funcname));
-    if_err_return(rv, var_copy_array(pid, shell_variables_ptr_addr, "BASH_SOURCE", &arr_source));
-    if_err_return(rv, var_copy_array(pid, shell_variables_ptr_addr, "BASH_LINENO", &arr_lineno));
-
-    char funcname[SHELLPEEK_STR_SIZE], source[SHELLPEEK_STR_SIZE], lineno[SHELLPEEK_STR_SIZE];
-    int line_number;
-    if_err_return(rv, var_copy_array_element(pid, &arr_funcname, 0, funcname, sizeof(funcname)));
-    if_err_return(rv, var_copy_array_element(pid, &arr_source, 0, source, sizeof(source)));
-    if_err_return(rv, copy_proc_mem(pid, line_number_addr, &line_number, sizeof(line_number), "line_number"));
-
-    printf("%s:%d %s\n", source, line_number, funcname);
-
-    int i = 0;
-    while (1) {
-        if_err_break(rv, var_copy_array_element(pid, &arr_funcname, i + 1, funcname, sizeof(funcname)));
-        if_err_break(rv, var_copy_array_element(pid, &arr_source, i + 1, source, sizeof(source)));
-        if_err_break(rv, var_copy_array_element(pid, &arr_lineno, i, lineno, sizeof(lineno)));
-        printf("%s:%s %s\n", source, lineno, funcname);
-        ++i;
-    }
-
-    return 0;
+    return ctx.exit_code;
 }
 
-static int get_symbol_addr(pid_t pid, const char *symbol, uintptr_t *raddr) {
+static void run(struct shellpeek_context *ctx) {
+    int iter = 0;
+    while (1) {
+        if_err_break(rv, peek(ctx));
+        ++iter;
+        if (ctx->repeat != 0 && iter >= ctx->repeat) break;
+        usleep(ctx->sleep_usec);
+    }
+}
+
+static int peek(struct shellpeek_context *ctx) {
+    // TODO: pause
+
+    if (!ctx->shell_variables_addr) {
+        uintptr_t shell_variables_ptr_addr;
+        if_err_return(rv, get_symbol_addr(ctx->pid, "shell_variables", &shell_variables_ptr_addr));
+        if_err_return(rv, copy_proc_mem(ctx->pid, shell_variables_ptr_addr, &ctx->shell_variables_addr, sizeof(ctx->shell_variables_addr), "%s:shell_variables_ptr_addr", __func__));
+        if_err_return(rv, get_symbol_addr(ctx->pid, "line_number", &ctx->line_number_addr));
+    }
+
+    ctx->peek_var_frame = 0;
+
+    int frame = 0;
+    while (1) {
+        if_err_return(rv, peek_stack(ctx, frame));
+        rv = peek_var(ctx, frame, NULL, NULL);
+        if (rv != SHELLPEEK_OK && rv != SHELLPEEK_NOTFOUND) return rv;
+        ++frame;
+        if (frame >= ctx->num_stack_frames) break;
+        if (ctx->max_depth > 0 && frame >= ctx->max_depth) break;
+    }
+    printf("\n");
+
+    return SHELLPEEK_OK;
+}
+
+static int peek_stack(struct shellpeek_context *ctx, int frame) {
+    char func[SHELLPEEK_STR_SIZE];
+    char source[SHELLPEEK_STR_SIZE];
+    char lineno[32];
+
+    if (frame == 0) {
+        if_err_return(rv, peek_array(ctx, "FUNCNAME", &ctx->array_func));
+        if_err_return(rv, peek_array(ctx, "BASH_SOURCE", &ctx->array_source));
+        if_err_return(rv, peek_array(ctx, "BASH_LINENO", &ctx->array_lineno));
+
+        ctx->num_stack_frames = ctx->array_func.num_elements;
+    }
+
+    int rframe = ctx->num_stack_frames - 1 - frame;
+
+    if (rframe <= 0) {
+        if_err_return(rv, peek_array_element(ctx, &ctx->array_func, 0, func, sizeof(func)));
+        if_err_return(rv, peek_array_element(ctx, &ctx->array_source, 0, source, sizeof(source)));
+        int lineno_int;
+        if_err_return(rv, copy_proc_mem(ctx->pid, ctx->line_number_addr, &lineno_int, sizeof(lineno_int), "%s:line_number", __func__));
+        printf("%5s %3d %s:%d %s\n", "frame", frame, source, lineno_int, func);
+    } else {
+        if_err_return(rv, peek_array_element(ctx, &ctx->array_func, rframe, func, sizeof(func)));
+        if_err_return(rv, peek_array_element(ctx, &ctx->array_source, rframe, source, sizeof(source)));
+        if_err_return(rv, peek_array_element(ctx, &ctx->array_lineno, rframe - 1, lineno, sizeof(lineno)));
+        printf("%5s %3d %s:%s %s\n", "frame", frame, source, lineno, func);
+    }
+
+    return SHELLPEEK_OK;
+}
+
+static int peek_var(struct shellpeek_context *ctx, int frame, char *var_name, struct bash_variable *out_var) {
+    // variables.c:var_lookup
+    struct bash_var_context tmp = {0};
+    struct bash_var_context *vc;
+
+    if (var_name) {
+        vc = &tmp;
+    } else {
+        vc = &ctx->var_context;
+        assert(frame == ctx->peek_var_frame);
+        ++ctx->peek_var_frame;
+    }
+
+    if (frame == 0) {
+        if (!ctx->root_shell_variables_addr) {
+            vc->down = (struct bash_var_context *)ctx->shell_variables_addr;
+            while (vc->down) {
+                ctx->root_shell_variables_addr = (uintptr_t)vc->down;
+                if_err_return(rv, copy_proc_mem(ctx->pid, (uintptr_t)vc->down, vc, sizeof(*vc), "%s:vc->down", __func__));
+            }
+        }
+        vc->up = (struct bash_var_context *)ctx->root_shell_variables_addr;
+    }
+
+    if (vc->up) {
+        if_err_return(rv, copy_proc_mem(ctx->pid, (uintptr_t)vc->up, vc, sizeof(*vc), "%s:vc->up", __func__));
+        if (!vc->table) return SHELLPEEK_NOTFOUND;
+
+        struct bash_hash_table ht;
+        if_err_return(rv, copy_proc_mem(ctx->pid, (uintptr_t)vc->table, &ht, sizeof(ht), "%s:vc->table", __func__));
+
+        return peek_hash(ctx, &ht, frame, var_name, out_var);
+    }
+
+    return SHELLPEEK_NOTFOUND;
+}
+
+static int peek_array(struct shellpeek_context *ctx, char *var_name, struct bash_array *out_arr) {
+    int rv;
+    struct bash_variable var;
+    if_err_return(rv, peek_var(ctx, 0, var_name, &var));
+    if (var.attributes && 0x0000004) { // array_att
+        if_err_return(rv, copy_proc_mem(ctx->pid, (uintptr_t)var.value, out_arr, sizeof(*out_arr), "%s:var.value", __func__));
+        return SHELLPEEK_OK;
+    }
+    return SHELLPEEK_NOTFOUND;
+}
+
+static int peek_array_element(struct shellpeek_context *ctx, struct bash_array *arr, int i, char *buf, size_t nbuf) {
+    // array.c:array_reference
+    if (!arr || arr->num_elements <= 0) {
+        return SHELLPEEK_NOTFOUND;
+    }
+
+    struct bash_array_element head, head_next;
+    if_err_return(rv, copy_proc_mem(ctx->pid, (uintptr_t)arr->head, &head, sizeof(head), "%s:arr->head", __func__));
+    if_err_return(rv, copy_proc_mem(ctx->pid, (uintptr_t)head.next, &head_next, sizeof(head_next), "%s:head.next", __func__));
+
+    if (i > arr->max_index || i < head_next.ind) {
+        return SHELLPEEK_NOTFOUND;
+    }
+
+    int direction = i >= head_next.ind ? 1 : -1;
+    struct bash_array_element *ae, *el;
+    struct bash_array_element tmp;
+    for (ae = &head_next, el = &head_next; ae != arr->head; ) {
+        if (el->ind == i) {
+            if_err_return(rv, copy_proc_mem(ctx->pid, (uintptr_t)el->value, buf, nbuf, "%s:el->value", __func__));
+            return SHELLPEEK_OK;
+        }
+
+        ae = direction == 1 ? el->next : el->prev;
+        if_err_return(rv, copy_proc_mem(ctx->pid, (uintptr_t)ae, &tmp, sizeof(tmp), "%s:ae", __func__));
+        el = &tmp;
+    }
+
+    return SHELLPEEK_NOTFOUND;
+}
+
+static int peek_hash(struct shellpeek_context *ctx, struct bash_hash_table *ht, int frame, char *var_name, struct bash_variable *out_var) {
+    if (!ht->bucket_array) return SHELLPEEK_NOTFOUND;
+
+    char *key = var_name ? var_name : ctx->var_name;
+
+    int hash_bucket_start, hash_bucket_end;
+    unsigned int hash_val;
+    if (key) {
+        hash_val = hash_string(key);
+        hash_bucket_start = hash_val & (ht->nbuckets - 1);
+        hash_bucket_end = hash_bucket_start;
+    } else {
+        hash_bucket_start = 0;
+        hash_bucket_end = ht->nbuckets - 1;
+    }
+
+    int hash_bucket;
+    for (hash_bucket = hash_bucket_start; hash_bucket <= hash_bucket_end; hash_bucket++) {
+        uintptr_t bucket_addr;
+        if_err_return(rv, copy_proc_mem(ctx->pid, (uintptr_t)(ht->bucket_array + hash_bucket), &bucket_addr, sizeof(bucket_addr), "%s:ht->bucket_array[bucket]", __func__));
+
+        struct bash_bucket_contents bucket;
+        for (; bucket_addr != 0; bucket_addr = (uintptr_t)bucket.next) {
+            if_err_return(rv, copy_proc_mem(ctx->pid, bucket_addr, &bucket, sizeof(bucket), "%s:bucket", __func__));
+
+            if (key && hash_val != bucket.khash) continue;
+
+            char bucket_key[SHELLPEEK_STR_SIZE];
+            if_err_return(rv, copy_proc_mem(ctx->pid, (uintptr_t)bucket.key, bucket_key, sizeof(bucket_key), "%s:bucket.key", __func__));
+
+            if (0
+                || (key && strcmp(key, bucket_key) == 0)
+                || (ctx->var_regex_set && regexec(&ctx->var_regex, bucket_key, 0, NULL, 0) == 0)
+                || ctx->var_all
+            ) {
+                struct bash_variable tmp;
+                struct bash_variable *var = var_name ? out_var : &tmp;
+
+                if_err_return(rv, copy_proc_mem(ctx->pid, (uintptr_t)bucket.data, var, sizeof(*var), "%s:var", __func__));
+
+                if (var_name) {
+                    return SHELLPEEK_OK;
+                } else if (var->value) {
+                    // TODO: typeset -p buf
+                    // TODO: var types (arrays, assoc, etc)
+                    unsigned char buf[SHELLPEEK_STR_SIZE];
+                    if_err_return(rv, copy_proc_mem(ctx->pid, (uintptr_t)var->value, buf, sizeof(buf), "%s:var->value", __func__));
+                    printf("%5s %3d %s=$'", "var", frame, bucket_key);
+                    unsigned char *sbuf;
+                    for (sbuf = buf; *sbuf != 0; sbuf++) {
+                        if (*sbuf >= 0x20 && *sbuf <= 0x7e) {
+                            putchar(*sbuf);
+                        } else {
+                            printf("\\x%02x", *sbuf);
+                        }
+                    }
+                    printf("'\n");
+                }
+            }
+        }
+    }
+
+    if (var_name) return SHELLPEEK_NOTFOUND;
+    return SHELLPEEK_OK;
+}
+
+static unsigned int hash_string(char *s) {
+    unsigned int i;
+    for (i = 2166136261; *s; s++) {
+        i += (i<<1) + (i<<4) + (i<<7) + (i<<8) + (i<<24);
+        i ^= *s;
+    }
+    return i;
+}
+
+static void set_var_regex(struct shellpeek_context *ctx, char *regex) {
+    if (ctx->var_regex_set) {
+        regfree(&ctx->var_regex);
+        ctx->var_regex_set = 0;
+    }
+    if ((rv = regcomp(&ctx->var_regex, regex, REG_EXTENDED | REG_NOSUB)) != 0) {
+        char errbuf[256];
+        regerror(rv, &ctx->var_regex, errbuf, sizeof(errbuf));
+        fprintf(stderr, "regcomp: %s\n", errbuf);
+        exit(1);
+    }
+    ctx->var_regex_set = 1;
+}
+
+static void usage(struct shellpeek_context *ctx, FILE *fp, int exit_code) {
+    fprintf(fp, "Usage:\n");
+    fprintf(fp, "  shellpeek [options] -p <pid>\n");
+    fprintf(fp, "\n");
+    fprintf(fp, "Options:\n");
+    fprintf(fp, "  -h, --help                         Show this help.\n");
+    fprintf(fp, "  -v, --version                      Show program version.\n");
+    fprintf(fp, "  -p, --pid=<pid>                    Trace Bash process at `pid`.\n");
+    fprintf(fp, "  -n, --repeat=<num>                 Repeat trace `num` times. (0=forever, default=%d)\n", ctx->repeat);
+    fprintf(fp, "  -i, --interval=<usec>              Sleep `usec` microseconds between each trace.\n");
+    fprintf(fp, "  -a, --var-name=<name>              Dump variable with `name`.\n");
+    fprintf(fp, "  -r, --var-regex=<regex>            Dump variables matching `regex`.\n");
+    fprintf(fp, "  -x, --var-all                      Dump all variables.\n");
+    fprintf(fp, "  -d, --max-depth=<num>              Descend a maximum of `num` stack frames. (0=unlimited, default=%d)\n", ctx->max_depth);
+    fprintf(fp, "  -S, --pause-process                Pause process while tracing.\n");
+    cleanup(ctx);
+    exit(exit_code);
+}
+
+static void parse_args(int argc, char **argv, struct shellpeek_context *ctx) {
+    struct option long_opts[] = {
+        { "help",                  no_argument,       NULL, 'h' },
+        { "version",               no_argument,       NULL, 'v' },
+        { "pid",                   required_argument, NULL, 'p' },
+        { "repeat",                required_argument, NULL, 'n' },
+        { "interval",              required_argument, NULL, 'i' },
+        { "var-name",              required_argument, NULL, 'a' },
+        { "var-regex",             required_argument, NULL, 'r' },
+        { "var-all",               no_argument,       NULL, 'x' },
+        { "max-depth",             required_argument, NULL, 'd' },
+        { "pause-process",         no_argument,       NULL, 'S' },
+        { 0 }
+    };
+
+    while (1) {
+        int c = getopt_long(argc, argv, "hvp:n:i:a:r:xd:S", long_opts, NULL);
+        if (c == -1) break;
+
+        switch (c) {
+            case 'h': usage(ctx, stdout, 0);                      break;
+            case 'v': print_version(ctx);                         break;
+            case 'p': ctx->pid = (pid_t)atoi(optarg);             break;
+            case 'n': ctx->repeat = atoi(optarg);                 break;
+            case 'i': ctx->sleep_usec = (useconds_t)atoi(optarg); break;
+            case 'a': ctx->var_name = optarg;                     break;
+            case 'r': set_var_regex(ctx, optarg);                 break;
+            case 'x': ctx->var_all = 1;                           break;
+            case 'd': ctx->max_depth = atoi(optarg);              break;
+            case 'S': ctx->pause_process = 1;                     break;
+            default:  usage(ctx, stderr, 1);                      break;
+        }
+    }
+}
+
+static void cleanup(struct shellpeek_context *ctx) {
+    if (ctx->var_regex_set) {
+        regfree(&ctx->var_regex);
+        ctx->var_regex_set = 0;
+    }
+}
+
+static void print_version(struct shellpeek_context *ctx) {
+    printf("shellpeek v%s\n", SHELLPEEK_VERSION);
+    cleanup(ctx);
+    exit(0);
+}
+
+static int copy_proc_mem(pid_t pid, uintptr_t raddri, void *laddr, size_t size, char *what_fmt, ...) {
+    struct iovec local[1];
+    struct iovec remote[1];
+    void *raddr = (void *)raddri;
+
+    char what[4096];
+    va_list vl;
+    va_start(vl, what_fmt);
+    vsnprintf(what, sizeof(what), what_fmt, vl);
+    va_end(vl);
+
+    if (raddr == NULL) {
+        fprintf(stderr, "copy_proc_mem: Not copying %s; raddr is NULL\n", what_fmt);
+        return SHELLPEEK_ERR;
+    }
+
+    local[0].iov_base = laddr;
+    local[0].iov_len = size;
+    remote[0].iov_base = raddr;
+    remote[0].iov_len = size;
+
+    if (process_vm_readv(pid, local, 1, remote, 1, 0) == -1) {
+        if (errno == ESRCH) { // No such process
+            perror("process_vm_readv");
+            return SHELLPEEK_ERR;
+        }
+        fprintf(stderr, "copy_proc_mem: Failed to copy %s; err=%s raddr=%p size=%lu\n", what, strerror(errno), raddr, size);
+        return SHELLPEEK_ERR;
+    }
+
+    return SHELLPEEK_OK;
+}
+
+static int get_symbol_addr(pid_t pid, char *symbol, uintptr_t *raddr) {
     char path[SHELLPEEK_STR_SIZE];
     char path_root[SHELLPEEK_STR_SIZE];
     uintptr_t base_addr;
@@ -197,7 +528,7 @@ static int get_bash_base_addr(pid_t pid, char *path, uintptr_t *raddr) {
     return SHELLPEEK_OK;
 }
 
-static int get_symbol_offset(char *path_root, const char *symbol, uintptr_t *raddr) {
+static int get_symbol_offset(char *path_root, char *symbol, uintptr_t *raddr) {
     char path_root_esc[SHELLPEEK_STR_SIZE];
     if_err_return(rv, shell_escape(path_root, path_root_esc, sizeof(path_root_esc), "path_root"));
 
@@ -244,7 +575,7 @@ static int popen_read_line(char *buf, size_t buf_size, char *cmd_fmt, ...) {
     return SHELLPEEK_OK;
 }
 
-static int shell_escape(const char *arg, char *buf, size_t buf_size, const char *what) {
+static int shell_escape(char *arg, char *buf, size_t buf_size, char *what) {
     rv = SHELLPEEK_OK;
     char *const buf_end = buf + buf_size;
     *buf++ = '\'';
@@ -286,183 +617,4 @@ shell_escape_end:
     }
 
     return rv;
-}
-
-static int copy_proc_mem(pid_t pid, uintptr_t raddri, void *laddr, size_t size, const char *what) {
-    struct iovec local[1];
-    struct iovec remote[1];
-    void *raddr = (void *)raddri;
-
-    if (raddr == NULL) {
-        fprintf(stderr, "copy_proc_mem: Not copying %s; raddr is NULL\n", what);
-        return SHELLPEEK_ERR;
-    }
-
-    local[0].iov_base = laddr;
-    local[0].iov_len = size;
-    remote[0].iov_base = raddr;
-    remote[0].iov_len = size;
-
-    if (process_vm_readv(pid, local, 1, remote, 1, 0) == -1) {
-        if (errno == ESRCH) { // No such process
-            perror("process_vm_readv");
-            return SHELLPEEK_ERR;
-        }
-        fprintf(stderr, "copy_proc_mem: Failed to copy %s; err=%s raddr=%p size=%lu\n", what, strerror(errno), raddr, size);
-        return SHELLPEEK_ERR;
-    }
-
-    return SHELLPEEK_OK;
-}
-
-static int var_copy(pid_t pid, uintptr_t shell_variables_ptr_addr, const char *varname, struct bash_variable *var) {
-    return var_scan(pid, shell_variables_ptr_addr, varname, var);
-}
-
-static int var_dump(pid_t pid, uintptr_t shell_variables_ptr_addr) {
-    return var_scan(pid, shell_variables_ptr_addr, NULL, NULL);
-}
-
-static int var_scan(pid_t pid, uintptr_t shell_variables_ptr_addr, const char *varname, struct bash_variable *var) {
-    // variables.c:var_lookup
-    struct bash_var_context vc;
-
-    vc.down = (struct bash_var_context *)shell_variables_ptr_addr;
-
-    while (vc.down) {
-        if_err_return(rv, copy_proc_mem(pid, (uintptr_t)vc.down, &vc, sizeof(vc), "vc.down"));
-        if (!vc.table) continue;
-
-        struct bash_hash_table ht;
-        if_err_return(rv, copy_proc_mem(pid, (uintptr_t)vc.table, &ht, sizeof(ht), "vc.table"));
-
-        if (varname) {
-            if ((rv = hash_lookup(pid, &ht, varname, var)) == SHELLPEEK_OK) {
-                return SHELLPEEK_OK;
-            } else if (rv != SHELLPEEK_NOTFOUND) {
-                return rv;
-            }
-        } else {
-            if_err_return(rv, hash_dump(pid, &ht));
-        }
-    }
-    if (varname) return SHELLPEEK_NOTFOUND;
-    return SHELLPEEK_OK;
-}
-
-
-static int var_copy_str(pid_t pid, uintptr_t shell_variables_ptr_addr, const char *varname, char *buf, size_t nbuf) {
-    int rv;
-    struct bash_variable var;
-    if_err_return(rv, var_copy(pid, shell_variables_ptr_addr, varname, &var));
-    if_err_return(rv, copy_proc_mem(pid, (uintptr_t)var.value, buf, nbuf, "var.value (char *)"));
-    return SHELLPEEK_OK;
-}
-
-static int var_copy_array(pid_t pid, uintptr_t shell_variables_ptr_addr, const char *varname, struct bash_array *arr) {
-    int rv;
-    struct bash_variable var;
-    if_err_return(rv, var_copy(pid, shell_variables_ptr_addr, varname, &var));
-    if (var.attributes && 0x0000004) { // array_att
-        if_err_return(rv, copy_proc_mem(pid, (uintptr_t)var.value, arr, sizeof(*arr), "var.value (bash_array *)"));
-        return SHELLPEEK_OK;
-    }
-    return SHELLPEEK_NOTFOUND;
-}
-
-static int var_copy_array_element(pid_t pid, struct bash_array *arr, int i, char *buf, size_t nbuf) {
-    // array.c:array_reference
-    if (!arr || arr->num_elements <= 0) {
-        return SHELLPEEK_NOTFOUND;
-    }
-
-    struct bash_array_element head, head_next;
-    if_err_return(rv, copy_proc_mem(pid, (uintptr_t)arr->head, &head, sizeof(head), "arr->head"));
-    if_err_return(rv, copy_proc_mem(pid, (uintptr_t)head.next, &head_next, sizeof(head_next), "head.next"));
-
-    if (i > arr->max_index || i < head_next.ind) {
-        return SHELLPEEK_NOTFOUND;
-    }
-
-    int direction = i >= head_next.ind ? 1 : -1;
-    struct bash_array_element *ae, *el;
-    struct bash_array_element tmp;
-    for (ae = &head_next, el = &head_next; ae != arr->head; ) {
-        if (el->ind == i) {
-            if_err_return(rv, copy_proc_mem(pid, (uintptr_t)el->value, buf, nbuf, "el->value (char *)"));
-            return SHELLPEEK_OK;
-        }
-
-        ae = direction == 1 ? el->next : el->prev;
-        if_err_return(rv, copy_proc_mem(pid, (uintptr_t)ae, &tmp, sizeof(tmp), "ae"));
-        el = &tmp;
-    }
-
-    return SHELLPEEK_NOTFOUND;
-}
-
-static int hash_lookup(pid_t pid, struct bash_hash_table *ht, const char *key, struct bash_variable *out_var) {
-    return hash_scan(pid, ht, key, out_var);
-}
-
-static int hash_dump(pid_t pid, struct bash_hash_table *ht) {
-    return hash_scan(pid, ht, NULL, NULL);
-}
-
-static int hash_scan(pid_t pid, struct bash_hash_table *ht, const char *key, struct bash_variable *out_var) {
-    if (!ht->bucket_array) return SHELLPEEK_NOTFOUND;
-
-    int hash_bucket_start, hash_bucket_end;
-    unsigned int hash_val;
-    if (key) {
-        hash_val = hash_string(key);
-        hash_bucket_start = hash_val & (ht->nbuckets - 1);
-        hash_bucket_end = hash_bucket_start;
-    } else {
-        hash_bucket_start = 0;
-        hash_bucket_end = ht->nbuckets - 1;
-    }
-
-    int hash_bucket;
-    for (hash_bucket = hash_bucket_start; hash_bucket <= hash_bucket_end; hash_bucket++) {
-
-        uintptr_t bucket_addr;
-        if_err_return(rv, copy_proc_mem(pid, (uintptr_t)(ht->bucket_array + hash_bucket), &bucket_addr, sizeof(bucket_addr), "ht->bucket_array[bucket]"));
-
-        struct bash_bucket_contents bucket;
-        for (; bucket_addr != 0; bucket_addr = (uintptr_t)bucket.next) {
-            if_err_return(rv, copy_proc_mem(pid, bucket_addr, &bucket, sizeof(bucket), "bucket"));
-
-            if (key && hash_val != bucket.khash) continue;
-
-            char bucket_key[SHELLPEEK_STR_SIZE];
-            if_err_return(rv, copy_proc_mem(pid, (uintptr_t)bucket.key, bucket_key, sizeof(bucket_key), "bucket.key"));
-
-            if (!key || strcmp(bucket_key, key) == 0) {
-                struct bash_variable tmp;
-                struct bash_variable *var = key ? out_var : &tmp;
-                uintptr_t data_addr = (uintptr_t)bucket.data;
-                if_err_return(rv, copy_proc_mem(pid, data_addr, var, sizeof(*var), "var"));
-                if (key) {
-                    return SHELLPEEK_OK;
-                } else if (var->value) {
-                    char buf[SHELLPEEK_STR_SIZE];
-                    if_err_return(rv, copy_proc_mem(pid, (uintptr_t)var->value, buf, sizeof(buf), "var.value (char *)"));
-                    printf("%s=%s\n", bucket_key, buf);
-                }
-            }
-        }
-    }
-
-    if (key) return SHELLPEEK_NOTFOUND;
-    return SHELLPEEK_OK;
-}
-
-static unsigned int hash_string(const char *s) {
-    unsigned int i;
-    for (i = 2166136261; *s; s++) {
-        i += (i<<1) + (i<<4) + (i<<7) + (i<<8) + (i<<24);
-        i ^= *s;
-    }
-    return i;
 }
