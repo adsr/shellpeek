@@ -14,6 +14,7 @@
 #define SHELLPEEK_STR_SIZE 1024
 
 #define if_err_return(rv, expr) if (((rv) = (expr)) != SHELLPEEK_OK) return (rv)
+#define if_err_break(rv, expr)  if (((rv) = (expr)) != SHELLPEEK_OK) break
 
 struct bash_bucket_contents;
 struct bash_hash_table;
@@ -76,11 +77,24 @@ static int get_symbol_offset(char *path_root, const char *symbol, uintptr_t *rad
 static int popen_read_line(char *buf, size_t buf_size, char *cmd_fmt, ...);
 static int shell_escape(const char *arg, char *buf, size_t buf_size, const char *what);
 static int copy_proc_mem(pid_t pid, uintptr_t raddri, void *laddr, size_t size, const char *what);
-static int copy_var(pid_t pid, uintptr_t shell_variables_ptr_addr, const char *varname, char *buf, size_t nbuf);
-static int hash_lookup(pid_t pid, struct bash_hash_table *ht, const char *str, uintptr_t *data_addr);
+static int var_copy(pid_t pid, uintptr_t shell_variables_ptr_addr, const char *varname, struct bash_variable *var);
+static int var_dump(pid_t pid, uintptr_t shell_variables_ptr_addr);
+static int var_scan(pid_t pid, uintptr_t shell_variables_ptr_addr, const char *varname, struct bash_variable *var);
+static int var_copy_str(pid_t pid, uintptr_t shell_variables_ptr_addr, const char *varname, char *buf, size_t nbuf);
+static int var_copy_array(pid_t pid, uintptr_t shell_variables_ptr_addr, const char *varname, struct bash_array *arr);
+static int var_copy_array_element(pid_t pid, struct bash_array *arr, int i, char *buf, size_t nbuf);
+static int hash_lookup(pid_t pid, struct bash_hash_table *ht, const char *key, struct bash_variable *out_var);
+static int hash_dump(pid_t pid, struct bash_hash_table *ht);
+static int hash_scan(pid_t pid, struct bash_hash_table *ht, const char *key, struct bash_variable *out_var);
 static unsigned int hash_string(const char *s);
 
 static int rv;
+
+// TODO: make hash_scan and var_scan cleaner with callbacks
+// TODO: get symbol table for each frame in stacktrace
+// TODO: print vars in `typeset -p ...` format
+// TODO: detect var type before printing
+// TODO: getopt
 
 int main(int argc, char **argv) {
     if (argc < 3) return 1;
@@ -91,15 +105,41 @@ int main(int argc, char **argv) {
     uintptr_t shell_variables_addr;
     if_err_return(rv, get_symbol_addr(pid, "shell_variables", &shell_variables_addr));
 
+    uintptr_t line_number_addr;
+    if_err_return(rv, get_symbol_addr(pid, "line_number", &line_number_addr));
+
     uintptr_t shell_variables_ptr_addr;
     if_err_return(rv, copy_proc_mem(pid, shell_variables_addr, &shell_variables_ptr_addr, sizeof(shell_variables_ptr_addr), "shell_variables_ptr"));
 
-    char buf[SHELLPEEK_STR_SIZE];
-    if_err_return(rv, copy_var(pid, shell_variables_ptr_addr, varname, buf, sizeof(buf)));
+    //char buf[SHELLPEEK_STR_SIZE];
+    //if_err_return(rv, var_copy_str(pid, shell_variables_ptr_addr, varname, buf, sizeof(buf)));
+    //printf("%s=%s\n", varname, buf);
+    (void)varname;
 
-    // TODO: Look at caller_builtin for unraveling stacktraces
+    var_dump(pid, shell_variables_ptr_addr);
 
-    printf("%s\n", buf);
+    struct bash_array arr_funcname, arr_source, arr_lineno;
+    if_err_return(rv, var_copy_array(pid, shell_variables_ptr_addr, "FUNCNAME", &arr_funcname));
+    if_err_return(rv, var_copy_array(pid, shell_variables_ptr_addr, "BASH_SOURCE", &arr_source));
+    if_err_return(rv, var_copy_array(pid, shell_variables_ptr_addr, "BASH_LINENO", &arr_lineno));
+
+    char funcname[SHELLPEEK_STR_SIZE], source[SHELLPEEK_STR_SIZE], lineno[SHELLPEEK_STR_SIZE];
+    int line_number;
+    if_err_return(rv, var_copy_array_element(pid, &arr_funcname, 0, funcname, sizeof(funcname)));
+    if_err_return(rv, var_copy_array_element(pid, &arr_source, 0, source, sizeof(source)));
+    if_err_return(rv, copy_proc_mem(pid, line_number_addr, &line_number, sizeof(line_number), "line_number"));
+
+    printf("%s:%d %s\n", source, line_number, funcname);
+
+    int i = 0;
+    while (1) {
+        if_err_break(rv, var_copy_array_element(pid, &arr_funcname, i + 1, funcname, sizeof(funcname)));
+        if_err_break(rv, var_copy_array_element(pid, &arr_source, i + 1, source, sizeof(source)));
+        if_err_break(rv, var_copy_array_element(pid, &arr_lineno, i, lineno, sizeof(lineno)));
+        printf("%s:%s %s\n", source, lineno, funcname);
+        ++i;
+    }
+
     return 0;
 }
 
@@ -210,17 +250,17 @@ static int shell_escape(const char *arg, char *buf, size_t buf_size, const char 
     *buf++ = '\'';
 
     while (*arg) {
-        /* logic based on https://stackoverflow.com/a/3669819 */
+        // Based on https://stackoverflow.com/a/3669819
         if (*arg == '\'') {
             if (buf_end - buf < 4) {
                 rv = SHELLPEEK_ERR;
                 goto shell_escape_end;
             }
 
-            *buf++ = '\''; /* close quoting */
-            *buf++ = '\\'; /* escape ... */
-            *buf++ = '\''; /* ... a single quote */
-            *buf++ = '\''; /* reopen quoting */
+            *buf++ = '\''; // close quoting
+            *buf++ = '\\'; // escape ...
+            *buf++ = '\''; // ... a single quote
+            *buf++ = '\''; // reopen quoting
             arg++;
         } else {
             if (buf_end - buf < 1) {
@@ -264,7 +304,7 @@ static int copy_proc_mem(pid_t pid, uintptr_t raddri, void *laddr, size_t size, 
     remote[0].iov_len = size;
 
     if (process_vm_readv(pid, local, 1, remote, 1, 0) == -1) {
-        if (errno == ESRCH) { /* No such process */
+        if (errno == ESRCH) { // No such process
             perror("process_vm_readv");
             return SHELLPEEK_ERR;
         }
@@ -275,7 +315,15 @@ static int copy_proc_mem(pid_t pid, uintptr_t raddri, void *laddr, size_t size, 
     return SHELLPEEK_OK;
 }
 
-static int copy_var(pid_t pid, uintptr_t shell_variables_ptr_addr, const char *varname, char *buf, size_t nbuf) {
+static int var_copy(pid_t pid, uintptr_t shell_variables_ptr_addr, const char *varname, struct bash_variable *var) {
+    return var_scan(pid, shell_variables_ptr_addr, varname, var);
+}
+
+static int var_dump(pid_t pid, uintptr_t shell_variables_ptr_addr) {
+    return var_scan(pid, shell_variables_ptr_addr, NULL, NULL);
+}
+
+static int var_scan(pid_t pid, uintptr_t shell_variables_ptr_addr, const char *varname, struct bash_variable *var) {
     // variables.c:var_lookup
     struct bash_var_context vc;
 
@@ -288,48 +336,126 @@ static int copy_var(pid_t pid, uintptr_t shell_variables_ptr_addr, const char *v
         struct bash_hash_table ht;
         if_err_return(rv, copy_proc_mem(pid, (uintptr_t)vc.table, &ht, sizeof(ht), "vc.table"));
 
-        uintptr_t data_addr;
-        rv = hash_lookup(pid, &ht, varname, &data_addr);
-        if (rv == SHELLPEEK_OK) {
-            struct bash_variable var;
-            if_err_return(rv, copy_proc_mem(pid, data_addr, &var, sizeof(var), "var"));
-            if_err_return(rv, copy_proc_mem(pid, (uintptr_t)var.value, buf, nbuf, "var.value"));
-            return SHELLPEEK_OK;
-        } else if (rv != SHELLPEEK_NOTFOUND) {
-            return rv;
+        if (varname) {
+            if ((rv = hash_lookup(pid, &ht, varname, var)) == SHELLPEEK_OK) {
+                return SHELLPEEK_OK;
+            } else if (rv != SHELLPEEK_NOTFOUND) {
+                return rv;
+            }
+        } else {
+            if_err_return(rv, hash_dump(pid, &ht));
         }
+    }
+    if (varname) return SHELLPEEK_NOTFOUND;
+    return SHELLPEEK_OK;
+}
+
+
+static int var_copy_str(pid_t pid, uintptr_t shell_variables_ptr_addr, const char *varname, char *buf, size_t nbuf) {
+    int rv;
+    struct bash_variable var;
+    if_err_return(rv, var_copy(pid, shell_variables_ptr_addr, varname, &var));
+    if_err_return(rv, copy_proc_mem(pid, (uintptr_t)var.value, buf, nbuf, "var.value (char *)"));
+    return SHELLPEEK_OK;
+}
+
+static int var_copy_array(pid_t pid, uintptr_t shell_variables_ptr_addr, const char *varname, struct bash_array *arr) {
+    int rv;
+    struct bash_variable var;
+    if_err_return(rv, var_copy(pid, shell_variables_ptr_addr, varname, &var));
+    if (var.attributes && 0x0000004) { // array_att
+        if_err_return(rv, copy_proc_mem(pid, (uintptr_t)var.value, arr, sizeof(*arr), "var.value (bash_array *)"));
+        return SHELLPEEK_OK;
     }
     return SHELLPEEK_NOTFOUND;
 }
 
+static int var_copy_array_element(pid_t pid, struct bash_array *arr, int i, char *buf, size_t nbuf) {
+    // array.c:array_reference
+    if (!arr || arr->num_elements <= 0) {
+        return SHELLPEEK_NOTFOUND;
+    }
 
-static int hash_lookup(pid_t pid, struct bash_hash_table *ht, const char *str, uintptr_t *data_addr) {
-    if (!ht->bucket_array) return SHELLPEEK_NOTFOUND;
+    struct bash_array_element head, head_next;
+    if_err_return(rv, copy_proc_mem(pid, (uintptr_t)arr->head, &head, sizeof(head), "arr->head"));
+    if_err_return(rv, copy_proc_mem(pid, (uintptr_t)head.next, &head_next, sizeof(head_next), "head.next"));
 
-    unsigned int hash_val = hash_string(str);
-    int hash_bucket = hash_val & (ht->nbuckets - 1);
+    if (i > arr->max_index || i < head_next.ind) {
+        return SHELLPEEK_NOTFOUND;
+    }
 
-    uintptr_t bucket_addr;
-    if_err_return(rv, copy_proc_mem(pid, (uintptr_t)(ht->bucket_array + hash_bucket), &bucket_addr, sizeof(bucket_addr), "ht->bucket_array[bucket]"));
-
-    while (bucket_addr != 0) {
-        struct bash_bucket_contents bucket;
-        if_err_return(rv, copy_proc_mem(pid, bucket_addr, &bucket, sizeof(bucket), "bucket"));
-
-        if (hash_val == bucket.khash) {
-            char key[SHELLPEEK_STR_SIZE];
-            if_err_return(rv, copy_proc_mem(pid, (uintptr_t)bucket.key, key, sizeof(key), "bucket.key"));
-
-            if (strcmp(key, str) == 0) {
-                *data_addr = (uintptr_t)bucket.data;
-                return SHELLPEEK_OK;
-            }
+    int direction = i >= head_next.ind ? 1 : -1;
+    struct bash_array_element *ae, *el;
+    struct bash_array_element tmp;
+    for (ae = &head_next, el = &head_next; ae != arr->head; ) {
+        if (el->ind == i) {
+            if_err_return(rv, copy_proc_mem(pid, (uintptr_t)el->value, buf, nbuf, "el->value (char *)"));
+            return SHELLPEEK_OK;
         }
 
-        bucket_addr = (uintptr_t)bucket.next;
+        ae = direction == 1 ? el->next : el->prev;
+        if_err_return(rv, copy_proc_mem(pid, (uintptr_t)ae, &tmp, sizeof(tmp), "ae"));
+        el = &tmp;
     }
 
     return SHELLPEEK_NOTFOUND;
+}
+
+static int hash_lookup(pid_t pid, struct bash_hash_table *ht, const char *key, struct bash_variable *out_var) {
+    return hash_scan(pid, ht, key, out_var);
+}
+
+static int hash_dump(pid_t pid, struct bash_hash_table *ht) {
+    return hash_scan(pid, ht, NULL, NULL);
+}
+
+static int hash_scan(pid_t pid, struct bash_hash_table *ht, const char *key, struct bash_variable *out_var) {
+    if (!ht->bucket_array) return SHELLPEEK_NOTFOUND;
+
+    int hash_bucket_start, hash_bucket_end;
+    unsigned int hash_val;
+    if (key) {
+        hash_val = hash_string(key);
+        hash_bucket_start = hash_val & (ht->nbuckets - 1);
+        hash_bucket_end = hash_bucket_start;
+    } else {
+        hash_bucket_start = 0;
+        hash_bucket_end = ht->nbuckets - 1;
+    }
+
+    int hash_bucket;
+    for (hash_bucket = hash_bucket_start; hash_bucket <= hash_bucket_end; hash_bucket++) {
+
+        uintptr_t bucket_addr;
+        if_err_return(rv, copy_proc_mem(pid, (uintptr_t)(ht->bucket_array + hash_bucket), &bucket_addr, sizeof(bucket_addr), "ht->bucket_array[bucket]"));
+
+        struct bash_bucket_contents bucket;
+        for (; bucket_addr != 0; bucket_addr = (uintptr_t)bucket.next) {
+            if_err_return(rv, copy_proc_mem(pid, bucket_addr, &bucket, sizeof(bucket), "bucket"));
+
+            if (key && hash_val != bucket.khash) continue;
+
+            char bucket_key[SHELLPEEK_STR_SIZE];
+            if_err_return(rv, copy_proc_mem(pid, (uintptr_t)bucket.key, bucket_key, sizeof(bucket_key), "bucket.key"));
+
+            if (!key || strcmp(bucket_key, key) == 0) {
+                struct bash_variable tmp;
+                struct bash_variable *var = key ? out_var : &tmp;
+                uintptr_t data_addr = (uintptr_t)bucket.data;
+                if_err_return(rv, copy_proc_mem(pid, data_addr, var, sizeof(*var), "var"));
+                if (key) {
+                    return SHELLPEEK_OK;
+                } else if (var->value) {
+                    char buf[SHELLPEEK_STR_SIZE];
+                    if_err_return(rv, copy_proc_mem(pid, (uintptr_t)var->value, buf, sizeof(buf), "var.value (char *)"));
+                    printf("%s=%s\n", bucket_key, buf);
+                }
+            }
+        }
+    }
+
+    if (key) return SHELLPEEK_NOTFOUND;
+    return SHELLPEEK_OK;
 }
 
 static unsigned int hash_string(const char *s) {
