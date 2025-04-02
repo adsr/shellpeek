@@ -106,6 +106,8 @@ static int peek_var(struct shellpeek_context *ctx, int frame, char *var_name, st
 static int peek_array(struct shellpeek_context *ctx, char *var_name, struct bash_array *out_arr);
 static int peek_array_element(struct shellpeek_context *ctx, struct bash_array *arr, int i, char *buf, size_t nbuf);
 static int peek_hash(struct shellpeek_context *ctx, struct bash_hash_table *ht, int frame, char *var_name, struct bash_variable *out_var);
+static int print_var(struct shellpeek_context *ctx, char *name, struct bash_variable *var, int frame);
+static void print_ansic_quoted(unsigned char *value);
 static unsigned int hash_string(char *s);
 static void set_var_regex(struct shellpeek_context *ctx, char *regex);
 static void usage(struct shellpeek_context *ctx, FILE *fp, int exit_code);
@@ -247,7 +249,7 @@ static int peek_array(struct shellpeek_context *ctx, char *var_name, struct bash
     int rv;
     struct bash_variable var;
     if_err_return(rv, peek_var(ctx, 0, var_name, &var));
-    if (var.attributes && 0x0000004) { // array_att
+    if (var.attributes && 0x04) { // array
         if_err_return(rv, copy_proc_mem(ctx->pid, (uintptr_t)var.value, out_arr, sizeof(*out_arr), "%s:var.value", __func__));
         return SHELLPEEK_OK;
     }
@@ -328,20 +330,7 @@ static int peek_hash(struct shellpeek_context *ctx, struct bash_hash_table *ht, 
                 if (var_name) {
                     return SHELLPEEK_OK;
                 } else if (var->value) {
-                    // TODO: typeset -p buf
-                    // TODO: var types (arrays, assoc, etc)
-                    unsigned char buf[SHELLPEEK_STR_SIZE];
-                    if_err_return(rv, copy_proc_mem(ctx->pid, (uintptr_t)var->value, buf, sizeof(buf), "%s:var->value", __func__));
-                    printf("%5s %3d %s=$'", "var", frame, bucket_key);
-                    unsigned char *sbuf;
-                    for (sbuf = buf; *sbuf != 0; sbuf++) {
-                        if (*sbuf >= 0x20 && *sbuf <= 0x7e) {
-                            putchar(*sbuf);
-                        } else {
-                            printf("\\x%02x", *sbuf);
-                        }
-                    }
-                    printf("'\n");
+                    if_err_return(rv, print_var(ctx, bucket_key, var, frame));
                 }
             }
         }
@@ -349,6 +338,68 @@ static int peek_hash(struct shellpeek_context *ctx, struct bash_hash_table *ht, 
 
     if (var_name) return SHELLPEEK_NOTFOUND;
     return SHELLPEEK_OK;
+}
+
+static int print_var(struct shellpeek_context *ctx, char *name, struct bash_variable *var, int frame) {
+    unsigned char buf[SHELLPEEK_STR_SIZE];
+
+    printf("%5s %3d %s=", "var", frame, name);
+
+    if (var->attributes & 0x04) { // array
+        struct bash_array arr;
+        if_err_return(rv, copy_proc_mem(ctx->pid, (uintptr_t)var->value, &arr, sizeof(arr), "%s:var->value:array", __func__));
+        putchar('(');
+        long i;
+        for (i = 0; i < arr.num_elements; i++) {
+            peek_array_element(ctx, &arr, i, (char *)buf, sizeof(buf));
+            print_ansic_quoted((unsigned char *)buf);
+            if (i < arr.num_elements - 1) putchar(' ');
+        }
+        putchar(')');
+    } else if (var->attributes & 0x40) { // assoc
+        struct bash_hash_table ht;
+        if_err_return(rv, copy_proc_mem(ctx->pid, (uintptr_t)var->value, &ht, sizeof(ht), "%s:var->value:assoc", __func__));
+        putchar('(');
+        int hash_bucket;
+        uintptr_t bucket_addr;
+        struct bash_bucket_contents bucket;
+        int remaining = ht.nentries;
+        for (hash_bucket = 0; hash_bucket < ht.nbuckets; hash_bucket++) {
+            if_err_return(rv, copy_proc_mem(ctx->pid, (uintptr_t)(ht.bucket_array + hash_bucket), &bucket_addr, sizeof(bucket_addr), "%s:ht->bucket_array[bucket]", __func__));
+            for (; bucket_addr != 0; bucket_addr = (uintptr_t)bucket.next) {
+                putchar('[');
+                if_err_return(rv, copy_proc_mem(ctx->pid, bucket_addr, &bucket, sizeof(bucket), "%s:bucket", __func__));
+                if_err_return(rv, copy_proc_mem(ctx->pid, (uintptr_t)bucket.key, buf, sizeof(buf), "%s:bucket.key", __func__));
+                buf[SHELLPEEK_STR_SIZE - 1] = '\0';
+                print_ansic_quoted(buf);
+                printf("]=");
+                if_err_return(rv, copy_proc_mem(ctx->pid, (uintptr_t)bucket.data, buf, sizeof(buf), "%s:bucket.data", __func__));
+                buf[SHELLPEEK_STR_SIZE - 1] = '\0';
+                print_ansic_quoted(buf);
+                --remaining;
+                if (remaining > 0) putchar(' ');
+            }
+        }
+        putchar(')');
+    } else {
+        if_err_return(rv, copy_proc_mem(ctx->pid, (uintptr_t)var->value, buf, sizeof(buf), "%s:var->value:string", __func__));
+        buf[SHELLPEEK_STR_SIZE - 1] = '\0';
+        print_ansic_quoted(buf);
+    }
+    putchar('\n');
+    return SHELLPEEK_OK;
+}
+
+static void print_ansic_quoted(unsigned char *value) {
+    printf("$'");
+    for (; *value != 0; value++) {
+        if (*value >= 0x20 && *value <= 0x7e) {
+            putchar(*value);
+        } else {
+            printf("\\x%02x", *value);
+        }
+    }
+    putchar('\'');
 }
 
 static unsigned int hash_string(char *s) {
@@ -379,16 +430,16 @@ static void usage(struct shellpeek_context *ctx, FILE *fp, int exit_code) {
     fprintf(fp, "  shellpeek [options] -p <pid>\n");
     fprintf(fp, "\n");
     fprintf(fp, "Options:\n");
-    fprintf(fp, "  -h, --help                         Show this help.\n");
-    fprintf(fp, "  -v, --version                      Show program version.\n");
-    fprintf(fp, "  -p, --pid=<pid>                    Trace Bash process at `pid`.\n");
-    fprintf(fp, "  -n, --repeat=<num>                 Repeat trace `num` times. (0=forever, default=%d)\n", ctx->repeat);
-    fprintf(fp, "  -i, --interval=<usec>              Sleep `usec` microseconds between each trace.\n");
-    fprintf(fp, "  -a, --var-name=<name>              Dump variable with `name`.\n");
-    fprintf(fp, "  -r, --var-regex=<regex>            Dump variables matching `regex`.\n");
-    fprintf(fp, "  -x, --var-all                      Dump all variables.\n");
-    fprintf(fp, "  -d, --max-depth=<num>              Descend a maximum of `num` stack frames. (0=unlimited, default=%d)\n", ctx->max_depth);
-    fprintf(fp, "  -S, --pause-process                Pause process while tracing.\n");
+    fprintf(fp, "  -h, --help              Show this help.\n");
+    fprintf(fp, "  -v, --version           Show program version.\n");
+    fprintf(fp, "  -p, --pid=<pid>         Trace Bash process at `pid`.\n");
+    fprintf(fp, "  -n, --repeat=<num>      Repeat trace `num` times. (0=forever, default=%d)\n", ctx->repeat);
+    fprintf(fp, "  -i, --interval=<usec>   Sleep `usec` microseconds between each trace.\n");
+    fprintf(fp, "  -a, --var-name=<name>   Dump variable with `name`.\n");
+    fprintf(fp, "  -r, --var-regex=<regex> Dump variables matching `regex`.\n");
+    fprintf(fp, "  -x, --var-all           Dump all variables.\n");
+    fprintf(fp, "  -d, --max-depth=<num>   Descend a maximum of `num` stack frames. (0=unlimited, default=%d)\n", ctx->max_depth);
+    fprintf(fp, "  -S, --pause-process     Pause process while tracing.\n");
     cleanup(ctx);
     exit(exit_code);
 }
