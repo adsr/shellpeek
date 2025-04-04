@@ -7,7 +7,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ptrace.h>
 #include <sys/uio.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #define SHELLPEEK_VERSION "0.1.0"
@@ -124,11 +126,10 @@ static int get_bash_base_addr(pid_t pid, char *path, uintptr_t *raddr);
 static int get_symbol_offset(char *path_root, char *symbol, uintptr_t *raddr);
 static int popen_read_line(char *buf, size_t buf_size, char *cmd_fmt, ...);
 static int shell_escape(char *arg, char *buf, size_t buf_size, char *what);
+static int pause_pid(pid_t pid);
+static int unpause_pid(pid_t pid);
 
 static int rv;
-
-// TODO: print vars in `typeset -p ...` format
-// TODO: detect var type before printing
 
 int main(int argc, char **argv) {
     struct shellpeek_context ctx;
@@ -136,6 +137,7 @@ int main(int argc, char **argv) {
     memset(&ctx, 0, sizeof(ctx));
     ctx.repeat = 1;
     ctx.max_depth = 0;
+    ctx.sleep_usec = 49999; // ~50ms
 
     parse_args(argc, argv, &ctx);
     run(&ctx);
@@ -147,16 +149,20 @@ int main(int argc, char **argv) {
 static void run(struct shellpeek_context *ctx) {
     int iter = 0;
     while (1) {
+        if (ctx->pause_process) if_err_break(rv, pause_pid(ctx->pid));
         if_err_break(rv, peek(ctx));
+        if (ctx->pause_process) if_err_break(rv, unpause_pid(ctx->pid));
+
         ++iter;
         if (ctx->repeat != 0 && iter >= ctx->repeat) break;
+
         usleep(ctx->sleep_usec);
     }
+
+    ctx->exit_code = rv;
 }
 
 static int peek(struct shellpeek_context *ctx) {
-    // TODO: pause
-
     if (!ctx->shell_variables_addr) {
         uintptr_t shell_variables_ptr_addr;
         if_err_return(rv, get_symbol_addr(ctx->pid, "shell_variables", &shell_variables_ptr_addr));
@@ -442,7 +448,7 @@ static void usage(struct shellpeek_context *ctx, FILE *fp, int exit_code) {
     fprintf(fp, "  -v, --version           Show program version.\n");
     fprintf(fp, "  -p, --pid=<pid>         Trace Bash process at `pid`.\n");
     fprintf(fp, "  -n, --repeat=<num>      Repeat trace `num` times. (0=forever, default=%d)\n", ctx->repeat);
-    fprintf(fp, "  -i, --interval=<usec>   Sleep `usec` microseconds between each trace.\n");
+    fprintf(fp, "  -i, --interval=<usec>   Sleep `usec` microseconds between each trace (default=%d).\n", ctx->sleep_usec);
     fprintf(fp, "  -a, --var-name=<name>   Dump variable with `name`.\n");
     fprintf(fp, "  -r, --var-regex=<regex> Dump variables matching `regex`.\n");
     fprintf(fp, "  -x, --var-all           Dump all variables.\n");
@@ -676,4 +682,24 @@ shell_escape_end:
     }
 
     return rv;
+}
+
+static int pause_pid(pid_t pid) {
+    if (ptrace(PTRACE_ATTACH, pid, 0, 0) == -1) {
+        perror("ptrace");
+        return SHELLPEEK_ERR;
+    }
+    if (waitpid(pid, NULL, 0) < 0) {
+        perror("waitpid");
+        return SHELLPEEK_ERR;
+    }
+    return SHELLPEEK_OK;
+}
+
+static int unpause_pid(pid_t pid) {
+    if (ptrace(PTRACE_DETACH, pid, 0, 0) == -1) {
+        perror("ptrace");
+        return SHELLPEEK_ERR;
+    }
+    return SHELLPEEK_OK;
 }
