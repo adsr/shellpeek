@@ -11,12 +11,15 @@
 #include <unistd.h>
 
 #define SHELLPEEK_VERSION "0.1.0"
+
+#ifndef SHELLPEEK_STR_SIZE
 #define SHELLPEEK_STR_SIZE 1024
+#endif
 
 enum {
-  SHELLPEEK_OK = 0,
-  SHELLPEEK_ERR,
-  SHELLPEEK_NOTFOUND,
+    SHELLPEEK_OK = 0,
+    SHELLPEEK_ERR,
+    SHELLPEEK_NOTFOUND,
 };
 
 #define if_err_return(rv, expr) if (((rv) = (expr)) != SHELLPEEK_OK) return (rv)
@@ -193,8 +196,13 @@ static int peek_stack(struct shellpeek_context *ctx, int frame) {
     int rframe = ctx->num_stack_frames - 1 - frame;
 
     if (rframe <= 0) {
-        if_err_return(rv, peek_array_element(ctx, &ctx->array_func, 0, func, sizeof(func)));
-        if_err_return(rv, peek_array_element(ctx, &ctx->array_source, 0, source, sizeof(source)));
+        if (ctx->array_func.num_elements > 0) {
+            if_err_return(rv, peek_array_element(ctx, &ctx->array_func, 0, func, sizeof(func)));
+            if_err_return(rv, peek_array_element(ctx, &ctx->array_source, 0, source, sizeof(source)));
+        } else {
+            sprintf(func, "<main>");
+            sprintf(source, "<main>");
+        }
         int lineno_int;
         if_err_return(rv, copy_proc_mem(ctx->pid, ctx->line_number_addr, &lineno_int, sizeof(lineno_int), "%s:line_number", __func__));
         printf("%5s %3d %s:%d %s\n", "frame", frame, source, lineno_int, func);
