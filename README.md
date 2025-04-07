@@ -100,8 +100,6 @@ frame   4 ./test.sh:17 f4
   var   4 my_int=$'43'
   var   4 my_assoc=([$'key2']=$'43' [$'key1']=$'42')
   var   4 my_arr=($'apple' $'banana' $'carrot')
-$
-```
 
 $
 $ # Peek at currently executing command
