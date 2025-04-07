@@ -86,10 +86,12 @@ struct shellpeek_context {
     uintptr_t shell_variables_addr;
     uintptr_t root_shell_variables_addr;
     uintptr_t line_number_addr;
+    uintptr_t command_addr;
     char *var_name;
     regex_t var_regex;
     int var_regex_set;
     int var_all;
+    int peek_command;
     int max_depth;
     long num_stack_frames;
     char tmp[SHELLPEEK_STR_SIZE];
@@ -168,6 +170,7 @@ static int peek(struct shellpeek_context *ctx) {
         if_err_return(rv, get_symbol_addr(ctx->pid, "shell_variables", &shell_variables_ptr_addr));
         if_err_return(rv, copy_proc_mem(ctx->pid, shell_variables_ptr_addr, &ctx->shell_variables_addr, sizeof(ctx->shell_variables_addr), "%s:shell_variables_ptr_addr", __func__));
         if_err_return(rv, get_symbol_addr(ctx->pid, "line_number", &ctx->line_number_addr));
+        if_err_return(rv, get_symbol_addr(ctx->pid, "the_printed_command", &ctx->command_addr));
     }
 
     ctx->peek_var_frame = 0;
@@ -189,6 +192,7 @@ static int peek(struct shellpeek_context *ctx) {
 static int peek_stack(struct shellpeek_context *ctx, int frame) {
     char func[SHELLPEEK_STR_SIZE];
     char source[SHELLPEEK_STR_SIZE];
+    char command[SHELLPEEK_STR_SIZE];
     char lineno[32];
 
     if (frame == 0) {
@@ -209,9 +213,21 @@ static int peek_stack(struct shellpeek_context *ctx, int frame) {
             sprintf(func, "<main>");
             sprintf(source, "<main>");
         }
+
         int lineno_int;
         if_err_return(rv, copy_proc_mem(ctx->pid, ctx->line_number_addr, &lineno_int, sizeof(lineno_int), "%s:line_number", __func__));
+
         printf("%5s %3d %s:%d %s\n", "frame", frame, source, lineno_int, func);
+
+        if (ctx->peek_command) {
+            uintptr_t command_str_addr;
+            if_err_return(rv, copy_proc_mem(ctx->pid, ctx->command_addr, &command_str_addr, sizeof(command_str_addr), "%s:command_str_addr", __func__));
+            if_err_return(rv, copy_proc_mem(ctx->pid, command_str_addr, command, sizeof(command), "%s:command", __func__));
+            command[SHELLPEEK_STR_SIZE - 1] = '\0';
+            printf("%5s %3d ", "comm", frame);
+            print_ansic_quoted((unsigned char *)command);
+            putchar('\n');
+        }
     } else {
         if_err_return(rv, peek_array_element(ctx, &ctx->array_func, rframe, func, sizeof(func)));
         if_err_return(rv, peek_array_element(ctx, &ctx->array_source, rframe, source, sizeof(source)));
@@ -407,7 +423,7 @@ static int print_var(struct shellpeek_context *ctx, char *name, struct bash_vari
 static void print_ansic_quoted(unsigned char *value) {
     printf("$'");
     for (; *value != 0; value++) {
-        if (*value >= 0x20 && *value <= 0x7e) {
+        if (*value >= 0x20 && *value <= 0x7e && *value != '\'') {
             putchar(*value);
         } else {
             printf("\\x%02x", *value);
@@ -452,6 +468,7 @@ static void usage(struct shellpeek_context *ctx, FILE *fp, int exit_code) {
     fprintf(fp, "  -a, --var-name=<name>   Dump variable with `name`.\n");
     fprintf(fp, "  -r, --var-regex=<regex> Dump variables matching `regex`.\n");
     fprintf(fp, "  -x, --var-all           Dump all variables.\n");
+    fprintf(fp, "  -c, --peek-command      Show executing command.\n");
     fprintf(fp, "  -d, --max-depth=<num>   Descend a maximum of `num` stack frames. (0=unlimited, default=%d)\n", ctx->max_depth);
     fprintf(fp, "  -S, --pause-process     Pause process while tracing.\n");
     cleanup(ctx);
@@ -468,13 +485,14 @@ static void parse_args(int argc, char **argv, struct shellpeek_context *ctx) {
         { "var-name",              required_argument, NULL, 'a' },
         { "var-regex",             required_argument, NULL, 'r' },
         { "var-all",               no_argument,       NULL, 'x' },
+        { "peek-command",          no_argument,       NULL, 'c' },
         { "max-depth",             required_argument, NULL, 'd' },
         { "pause-process",         no_argument,       NULL, 'S' },
         { 0 }
     };
 
     while (1) {
-        int c = getopt_long(argc, argv, "hvp:n:i:a:r:xd:S", long_opts, NULL);
+        int c = getopt_long(argc, argv, "hvp:n:i:a:r:xcd:S", long_opts, NULL);
         if (c == -1) break;
 
         switch (c) {
@@ -486,6 +504,7 @@ static void parse_args(int argc, char **argv, struct shellpeek_context *ctx) {
             case 'a': ctx->var_name = optarg;                     break;
             case 'r': set_var_regex(ctx, optarg);                 break;
             case 'x': ctx->var_all = 1;                           break;
+            case 'c': ctx->peek_command = 1;                      break;
             case 'd': ctx->max_depth = atoi(optarg);              break;
             case 'S': ctx->pause_process = 1;                     break;
             default:  usage(ctx, stderr, 1);                      break;

@@ -42,9 +42,9 @@ $ cat -n test.sh
     24    f1
 $ ./test.sh &
 [1] 340448
-$ 
+$
 $ # Peek stacktrace
-$ 
+$
 $ shellpeek -p 340448
 frame   0 ./test.sh:24 main
 frame   1 ./test.sh:4 f1
@@ -52,9 +52,9 @@ frame   2 ./test.sh:9 f2
 frame   3 ./test.sh:14 f3
 frame   4 ./test.sh:17 f4
 
-$ 
+$
 $ # Peek at a variable
-$ 
+$
 $ shellpeek -p 340448 -a my_var
 frame   0 ./test.sh:24 main
   var   0 my_var=$'global in f2'
@@ -64,9 +64,9 @@ frame   3 ./test.sh:14 f3
   var   3 my_var=$'local in f3'
 frame   4 ./test.sh:17 f4
 
-$ 
+$
 $ # Peek at variables matching regex
-$ 
+$
 $ shellpeek -p 340448 -r ^my_
 frame   0 ./test.sh:24 main
   var   0 my_var=$'global in f2'
@@ -79,9 +79,9 @@ frame   4 ./test.sh:17 f4
   var   4 my_assoc=([$'key2']=$'43' [$'key1']=$'42')
   var   4 my_arr=($'apple' $'banana' $'carrot')
 
-$ 
+$
 $ # Peek at all variables
-$ 
+$
 $ shellpeek -p 340448 -x
 frame   0 ./test.sh:24 main
   var   0 SHELL=$'/bin/bash'
@@ -100,5 +100,18 @@ frame   4 ./test.sh:17 f4
   var   4 my_int=$'43'
   var   4 my_assoc=([$'key2']=$'43' [$'key1']=$'42')
   var   4 my_arr=($'apple' $'banana' $'carrot')
-$ 
+$
+```
+
+$
+$ # Peek at currently executing command
+$
+$ shellpeek -p 340448 -c
+frame   0 ./test.sh:24 main
+frame   1 ./test.sh:4 f1
+frame   2 ./test.sh:9 f2
+frame   3 ./test.sh:14 f3
+frame   4 ./test.sh:17 f4
+ comm   4 sleep 9999
+$
 ```
